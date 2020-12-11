@@ -10,9 +10,10 @@
 #include "CoreController.h"
 
 #include <QApplication>
+#include <QMutexLocker>
+#include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLPaintDevice>
-#include <QMutexLocker>
 #include <QResizeEvent>
 #include <QScreen>
 #include <QTimer>
@@ -34,6 +35,15 @@
 
 using namespace QGBA;
 
+QHash<QSurfaceFormat, bool> DisplayGL::s_supports;
+
+uint qHash(const QSurfaceFormat& format, uint seed) {
+	QByteArray representation;
+	QDataStream stream(&representation, QIODevice::WriteOnly);
+	stream << format.version() << format.renderableType() << format.profile();
+	return qHash(representation, seed);
+}
+
 DisplayGL::DisplayGL(const QSurfaceFormat& format, QWidget* parent)
 	: Display(parent)
 {
@@ -41,10 +51,23 @@ DisplayGL::DisplayGL(const QSurfaceFormat& format, QWidget* parent)
 	windowHandle()->create();
 
 	m_painter = std::make_unique<PainterGL>(windowHandle(), format);
+	m_drawThread.setObjectName("Painter Thread");
+	m_painter->moveToThread(&m_drawThread);
+
+	connect(&m_drawThread, &QThread::started, m_painter.get(), &PainterGL::create);
+	connect(m_painter.get(), &PainterGL::started, this, [this] {
+		m_hasStarted = true;
+		resizePainter();
+		emit drawingStarted();
+	});
+	m_drawThread.start();
 }
 
 DisplayGL::~DisplayGL() {
 	stopDrawing();
+	QMetaObject::invokeMethod(m_painter.get(), "destroy", Qt::BlockingQueuedConnection);
+	m_drawThread.exit();
+	m_drawThread.wait();
 }
 
 bool DisplayGL::supportsShaders() const {
@@ -53,34 +76,21 @@ bool DisplayGL::supportsShaders() const {
 
 VideoShader* DisplayGL::shaders() {
 	VideoShader* shaders = nullptr;
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "shaders", Qt::BlockingQueuedConnection, Q_RETURN_ARG(VideoShader*, shaders));
-	} else {
-		shaders = m_painter->shaders();
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "shaders", Qt::BlockingQueuedConnection, Q_RETURN_ARG(VideoShader*, shaders));
 	return shaders;
 }
 
 void DisplayGL::startDrawing(std::shared_ptr<CoreController> controller) {
-	if (m_drawThread) {
+	if (m_isDrawing) {
 		return;
 	}
 	m_isDrawing = true;
 	m_painter->setContext(controller);
 	m_painter->setMessagePainter(messagePainter());
 	m_context = controller;
-	m_drawThread = new QThread(this);
-	m_drawThread->setObjectName("Painter Thread");
-	m_painter->moveToThread(m_drawThread);
 	if (videoProxy()) {
-		videoProxy()->moveToThread(m_drawThread);
+		videoProxy()->moveToThread(&m_drawThread);
 	}
-	connect(m_drawThread, &QThread::started, m_painter.get(), &PainterGL::start);
-	connect(m_painter.get(), &PainterGL::started, this, [this] {
-		m_hasStarted = true;
-		resizePainter();
-		emit drawingStarted();
-	});
 
 	lockAspectRatio(isAspectRatioLocked());
 	lockIntegerScaling(isIntegerScalingLocked());
@@ -88,32 +98,66 @@ void DisplayGL::startDrawing(std::shared_ptr<CoreController> controller) {
 	showOSDMessages(isShowOSD());
 	filter(isFiltered());
 
-	m_drawThread->start();
-
 #if (QT_VERSION >= QT_VERSION_CHECK(5, 6, 0))
 	messagePainter()->resize(size(), isAspectRatioLocked(), devicePixelRatioF());
 #else
 	messagePainter()->resize(size(), isAspectRatioLocked(), devicePixelRatio());
 #endif
+	QMetaObject::invokeMethod(m_painter.get(), "start");
 	setUpdatesEnabled(false);
 }
 
+bool DisplayGL::supportsFormat(const QSurfaceFormat& format) {
+	if (!s_supports.contains(format)) {
+		QOpenGLContext context;
+		context.setFormat(format);
+		if (!context.create()) {
+			s_supports[format] = false;
+			return false;
+		}
+		auto foundVersion = context.format().version();
+		if (foundVersion == format.version()) {
+			// Match!
+			s_supports[format] = true;
+		} else if (format.version() >= qMakePair(3, 2) && foundVersion > format.version()) {
+			// At least as good
+			s_supports[format] = true;
+		} else if (format.majorVersion() == 1 && (foundVersion < qMakePair(3, 0) ||
+		           context.format().profile() == QSurfaceFormat::CompatibilityProfile ||
+		           context.format().testOption(QSurfaceFormat::DeprecatedFunctions))) {
+			// Supports the old stuff
+			s_supports[format] = true;
+		} else if (!context.isOpenGLES() && format.version() >= qMakePair(2, 1) && foundVersion < qMakePair(3, 0) && foundVersion >= qMakePair(2, 1)) {
+			// Weird edge case we support if ARB_framebuffer_object is present
+			QOffscreenSurface surface;
+			surface.create();
+			if (!context.makeCurrent(&surface)) {
+				s_supports[format] = false;
+				return false;
+			}
+			s_supports[format] = context.hasExtension("GL_ARB_framebuffer_object");
+			context.doneCurrent();
+		} else {
+			// No match
+			s_supports[format] = false;
+		}
+	}
+	return s_supports[format];
+}
+
 void DisplayGL::stopDrawing() {
-	if (m_drawThread) {
+	if (m_hasStarted || m_isDrawing) {
 		m_isDrawing = false;
 		m_hasStarted = false;
 		CoreController::Interrupter interrupter(m_context);
 		QMetaObject::invokeMethod(m_painter.get(), "stop", Qt::BlockingQueuedConnection);
-		m_drawThread->exit();
-		m_drawThread->wait();
-		m_drawThread = nullptr;
 		setUpdatesEnabled(true);
 	}
 	m_context.reset();
 }
 
 void DisplayGL::pauseDrawing() {
-	if (m_drawThread) {
+	if (m_hasStarted) {
 		m_isDrawing = false;
 		CoreController::Interrupter interrupter(m_context);
 		QMetaObject::invokeMethod(m_painter.get(), "pause", Qt::BlockingQueuedConnection);
@@ -124,7 +168,7 @@ void DisplayGL::pauseDrawing() {
 }
 
 void DisplayGL::unpauseDrawing() {
-	if (m_drawThread) {
+	if (m_hasStarted) {
 		m_isDrawing = true;
 		CoreController::Interrupter interrupter(m_context);
 		QMetaObject::invokeMethod(m_painter.get(), "unpause", Qt::BlockingQueuedConnection);
@@ -135,78 +179,59 @@ void DisplayGL::unpauseDrawing() {
 }
 
 void DisplayGL::forceDraw() {
-	if (m_drawThread) {
+	if (m_hasStarted) {
 		QMetaObject::invokeMethod(m_painter.get(), "forceDraw");
 	}
 }
 
 void DisplayGL::lockAspectRatio(bool lock) {
 	Display::lockAspectRatio(lock);
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "lockAspectRatio", Q_ARG(bool, lock));
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "lockAspectRatio", Q_ARG(bool, lock));
 }
 
 void DisplayGL::lockIntegerScaling(bool lock) {
 	Display::lockIntegerScaling(lock);
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "lockIntegerScaling", Q_ARG(bool, lock));
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "lockIntegerScaling", Q_ARG(bool, lock));
 }
 
 void DisplayGL::interframeBlending(bool enable) {
 	Display::interframeBlending(enable);
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "interframeBlending", Q_ARG(bool, enable));
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "interframeBlending", Q_ARG(bool, enable));
 }
 
 void DisplayGL::showOSDMessages(bool enable) {
 	Display::showOSDMessages(enable);
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "showOSD", Q_ARG(bool, enable));
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "showOSD", Q_ARG(bool, enable));
 }
 
 void DisplayGL::filter(bool filter) {
 	Display::filter(filter);
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "filter", Q_ARG(bool, filter));
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "filter", Q_ARG(bool, filter));
 }
 
 void DisplayGL::framePosted() {
-	if (m_drawThread) {
-		m_painter->enqueue(m_context->drawContext());
-		QMetaObject::invokeMethod(m_painter.get(), "draw");
-	}
+	m_painter->enqueue(m_context->drawContext());
+	QMetaObject::invokeMethod(m_painter.get(), "draw");
 }
 
 void DisplayGL::setShaders(struct VDir* shaders) {
-	if (m_drawThread) {
-		QMetaObject::invokeMethod(m_painter.get(), "setShaders", Qt::BlockingQueuedConnection, Q_ARG(struct VDir*, shaders));
-	} else {
-		m_painter->setShaders(shaders);
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "setShaders", Qt::BlockingQueuedConnection, Q_ARG(struct VDir*, shaders));
 }
 
 void DisplayGL::clearShaders() {
-	QMetaObject::invokeMethod(m_painter.get(), "clearShaders");
+	QMetaObject::invokeMethod(m_painter.get(), "clearShaders", Qt::BlockingQueuedConnection);
 }
 
 void DisplayGL::resizeContext() {
-	if (m_drawThread) {
-		CoreController::Interrupter interrupter(m_context);
-		QMetaObject::invokeMethod(m_painter.get(), "resizeContext");
-	}
+	QMetaObject::invokeMethod(m_painter.get(), "resizeContext");
 }
 
 void DisplayGL::setVideoScale(int scale) {
-	if (m_drawThread) {
+	if (m_context) {
 		CoreController::Interrupter interrupter(m_context);
 		mCoreConfigSetIntValue(&m_context->thread()->core->config, "videoScale", scale);
-		QMetaObject::invokeMethod(m_painter.get(), "resizeContext");
 	}
+	QMetaObject::invokeMethod(m_painter.get(), "resizeContext");
 }
 
 void DisplayGL::resizeEvent(QResizeEvent* event) {
@@ -215,15 +240,15 @@ void DisplayGL::resizeEvent(QResizeEvent* event) {
 }
 
 void DisplayGL::resizePainter() {
-	if (m_drawThread && m_hasStarted) {
+	if (m_hasStarted) {
 		QMetaObject::invokeMethod(m_painter.get(), "resize", Qt::BlockingQueuedConnection, Q_ARG(QSize, size()));
 	}
 }
 
 void DisplayGL::setVideoProxy(std::shared_ptr<VideoProxy> proxy) {
 	Display::setVideoProxy(proxy);
-	if (m_drawThread && proxy) {
-		proxy->moveToThread(m_drawThread);
+	if (proxy) {
+		proxy->moveToThread(&m_drawThread);
 	}
 	m_painter->setVideoProxy(proxy);
 }
@@ -236,6 +261,7 @@ PainterGL::PainterGL(QWindow* surface, const QSurfaceFormat& format)
 	: m_surface(surface)
 	, m_format(format)
 {
+	m_supportsShaders = m_format.version() >= qMakePair(2, 0);
 	for (auto& buf : m_buffers) {
 		m_free.append(&buf.front());
 	}
@@ -260,24 +286,6 @@ void PainterGL::create() {
 	m_gl->create();
 	makeCurrent();
 
-	auto version = m_gl->format().version();
-	QStringList extensions = QString(reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS))).split(' ');
-
-	int forceVersion = 0;
-	if (m_format.majorVersion() < 2) {
-		forceVersion = 1;
-	}
-
-	if ((version == qMakePair(2, 1) && !extensions.contains("GL_ARB_framebuffer_object")) || version == qMakePair(2, 0)) {
-		QSurfaceFormat newFormat(m_format);
-		newFormat.setVersion(1, 4);
-		forceVersion = 1;
-		m_gl->doneCurrent();
-		m_gl->setFormat(newFormat);
-		m_gl->create();
-		makeCurrent();
-	}
-
 #ifdef BUILD_GL
 	mGLContext* glBackend;
 #endif
@@ -288,13 +296,11 @@ void PainterGL::create() {
 	m_window = std::make_unique<QOpenGLPaintDevice>();
 
 #ifdef BUILD_GLES2
-	version = m_gl->format().version();
-	extensions = QString(reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS))).split(' ');
-	if (forceVersion != 1 && ((version == qMakePair(2, 1) && extensions.contains("GL_ARB_framebuffer_object")) || version.first > 2)) {
+	auto version = m_format.version();
+	if (version >= qMakePair(2, 0)) {
 		gl2Backend = static_cast<mGLES2Context*>(malloc(sizeof(mGLES2Context)));
 		mGLES2ContextCreate(gl2Backend);
 		m_backend = &gl2Backend->d;
-		m_supportsShaders = true;
 	}
 #endif
 
@@ -303,7 +309,6 @@ void PainterGL::create() {
 		glBackend = static_cast<mGLContext*>(malloc(sizeof(mGLContext)));
 		mGLContextCreate(glBackend);
 		m_backend = &glBackend->d;
-		m_supportsShaders = false;
 	}
 #endif
 	m_backend->swap = [](VideoBackend* v) {
@@ -333,15 +338,6 @@ void PainterGL::destroy() {
 		return;
 	}
 	makeCurrent();
-	if (m_context) {
-		if (m_videoProxy) {
-			m_videoProxy->detach(m_context.get());
-		}
-		m_context->setFramebufferHandle(-1);
-		if (m_videoProxy) {
-			m_videoProxy->processData();
-		}
-	}
 #ifdef BUILD_GLES2
 	if (m_shader.passes) {
 		mGLES2ShaderFree(&m_shader);
@@ -366,6 +362,7 @@ void PainterGL::resizeContext() {
 	}
 
 	if (m_started) {
+		CoreController::Interrupter interrupter(m_context);
 		mCore* core = m_context->thread()->core;
 		core->reloadConfigOption(core, "videoScale", NULL);
 	}
@@ -412,9 +409,6 @@ void PainterGL::filter(bool filter) {
 }
 
 void PainterGL::start() {
-	if (!m_gl) {
-		create();
-	}
 	makeCurrent();
 
 #ifdef BUILD_GLES2
@@ -482,16 +476,23 @@ void PainterGL::stop() {
 	m_active = false;
 	m_started = false;
 	dequeueAll();
-	m_backend->clear(m_backend);
-	m_backend->swap(m_backend);
+	if (m_context) {
+		if (m_videoProxy) {
+			m_videoProxy->detach(m_context.get());
+		}
+		m_context->setFramebufferHandle(-1);
+		m_context.reset();
+		if (m_videoProxy) {
+			m_videoProxy->processData();
+		}
+	}
 	if (m_videoProxy) {
 		m_videoProxy->reset();
-	}
-	destroy();
-	moveToThread(m_surface->thread());
-	if (m_videoProxy) {
 		m_videoProxy->moveToThread(m_surface->thread());
+		m_videoProxy.reset();
 	}
+	m_backend->clear(m_backend);
+	m_backend->swap(m_backend);
 }
 
 void PainterGL::pause() {
@@ -578,9 +579,6 @@ void PainterGL::setShaders(struct VDir* dir) {
 		return;
 	}
 #ifdef BUILD_GLES2
-	if (!m_started) {
-		return; // TODO
-	}
 	if (m_shader.passes) {
 		mGLES2ShaderDetach(reinterpret_cast<mGLES2Context*>(m_backend));
 		mGLES2ShaderFree(&m_shader);
@@ -595,9 +593,6 @@ void PainterGL::clearShaders() {
 		return;
 	}
 #ifdef BUILD_GLES2
-	if (!m_started) {
-		return; // TODO
-	}
 	if (m_shader.passes) {
 		mGLES2ShaderDetach(reinterpret_cast<mGLES2Context*>(m_backend));
 		mGLES2ShaderFree(&m_shader);

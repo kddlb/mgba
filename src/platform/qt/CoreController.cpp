@@ -499,7 +499,7 @@ void CoreController::loadState(int slot) {
 	mCoreThreadRunFunction(&m_threadContext, [](mCoreThread* context) {
 		CoreController* controller = static_cast<CoreController*>(context->userData);
 		if (!controller->m_backupLoadState.isOpen()) {
-			controller->m_backupLoadState = VFileMemChunk(nullptr, 0);
+			controller->m_backupLoadState = VFileDevice::openMemory();
 		}
 		mCoreSaveStateNamed(context->core, controller->m_backupLoadState, controller->m_saveStateFlags);
 		if (mCoreLoadState(context->core, controller->m_stateSlot, controller->m_loadStateFlags)) {
@@ -509,8 +509,12 @@ void CoreController::loadState(int slot) {
 	});
 }
 
-void CoreController::loadState(const QString& path) {
+void CoreController::loadState(const QString& path, int flags) {
 	m_statePath = path;
+	int savedFlags = m_loadStateFlags;
+	if (flags != -1) {
+		m_loadStateFlags = flags;
+	}
 	mCoreThreadRunFunction(&m_threadContext, [](mCoreThread* context) {
 		CoreController* controller = static_cast<CoreController*>(context->userData);
 		VFile* vf = VFileDevice::open(controller->m_statePath, O_RDONLY);
@@ -518,7 +522,7 @@ void CoreController::loadState(const QString& path) {
 			return;
 		}
 		if (!controller->m_backupLoadState.isOpen()) {
-			controller->m_backupLoadState = VFileMemChunk(nullptr, 0);
+			controller->m_backupLoadState = VFileDevice::openMemory();
 		}
 		mCoreSaveStateNamed(context->core, controller->m_backupLoadState, controller->m_saveStateFlags);
 		if (mCoreLoadStateNamed(context->core, vf, controller->m_loadStateFlags)) {
@@ -527,6 +531,35 @@ void CoreController::loadState(const QString& path) {
 		}
 		vf->close(vf);
 	});
+	m_loadStateFlags = savedFlags;
+}
+
+void CoreController::loadState(QIODevice* iodev, int flags) {
+	m_stateVf = VFileDevice::wrap(iodev, QIODevice::ReadOnly);
+	if (!m_stateVf) {
+		return;
+	}
+	int savedFlags = m_loadStateFlags;
+	if (flags != -1) {
+		m_loadStateFlags = flags;
+	}
+	mCoreThreadRunFunction(&m_threadContext, [](mCoreThread* context) {
+		CoreController* controller = static_cast<CoreController*>(context->userData);
+		VFile* vf = controller->m_stateVf;
+		if (!vf) {
+			return;
+		}
+		if (!controller->m_backupLoadState.isOpen()) {
+			controller->m_backupLoadState = VFileDevice::openMemory();
+		}
+		mCoreSaveStateNamed(context->core, controller->m_backupLoadState, controller->m_saveStateFlags);
+		if (mCoreLoadStateNamed(context->core, vf, controller->m_loadStateFlags)) {
+			emit controller->frameAvailable();
+			emit controller->stateLoaded();
+		}
+		vf->close(vf);
+	});
+	m_loadStateFlags = savedFlags;
 }
 
 void CoreController::saveState(int slot) {
@@ -545,8 +578,12 @@ void CoreController::saveState(int slot) {
 	});
 }
 
-void CoreController::saveState(const QString& path) {
+void CoreController::saveState(const QString& path, int flags) {
 	m_statePath = path;
+	int savedFlags = m_saveStateFlags;
+	if (flags != -1) {
+		m_saveStateFlags = flags;
+	}
 	mCoreThreadRunFunction(&m_threadContext, [](mCoreThread* context) {
 		CoreController* controller = static_cast<CoreController*>(context->userData);
 		VFile* vf = VFileDevice::open(controller->m_statePath, O_RDONLY);
@@ -562,6 +599,28 @@ void CoreController::saveState(const QString& path) {
 		mCoreSaveStateNamed(context->core, vf, controller->m_saveStateFlags);
 		vf->close(vf);
 	});
+	m_saveStateFlags = savedFlags;
+}
+
+void CoreController::saveState(QIODevice* iodev, int flags) {
+	m_stateVf = VFileDevice::wrap(iodev, QIODevice::WriteOnly | QIODevice::Truncate);
+	if (!m_stateVf) {
+		return;
+	}
+	int savedFlags = m_saveStateFlags;
+	if (flags != -1) {
+		m_saveStateFlags = flags;
+	}
+	mCoreThreadRunFunction(&m_threadContext, [](mCoreThread* context) {
+		CoreController* controller = static_cast<CoreController*>(context->userData);
+		VFile* vf = controller->m_stateVf;
+		if (!vf) {
+			return;
+		}
+		mCoreSaveStateNamed(context->core, vf, controller->m_saveStateFlags);
+		vf->close(vf);
+	});
+	m_saveStateFlags = savedFlags;
 }
 
 void CoreController::loadBackupState() {
@@ -654,6 +713,9 @@ void CoreController::yankPak() {
 		GBYankROM(static_cast<GB*>(m_threadContext.core->board));
 		break;
 #endif
+	case PLATFORM_NONE:
+		LOG(QT, ERROR) << tr("Can't yank pack in unexpected platform!");
+		break;
 	}
 }
 
@@ -865,7 +927,7 @@ void CoreController::startVideoLog(const QString& path, bool compression) {
 	if (!vf) {
 		return;
 	}
-	startVideoLog(vf);
+	startVideoLog(vf, compression);
 }
 
 void CoreController::startVideoLog(VFile* vf, bool compression) {

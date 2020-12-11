@@ -47,6 +47,7 @@
 #include "PaletteView.h"
 #include "PlacementControl.h"
 #include "PrinterView.h"
+#include "ReportView.h"
 #include "ROMInfo.h"
 #include "SensorView.h"
 #include "SettingsView.h"
@@ -884,6 +885,12 @@ void Window::reloadDisplayDriver() {
 		detachWidget(m_display.get());
 	}
 	m_display = std::unique_ptr<Display>(Display::create(this));
+	if (!m_display) {
+		LOG(QT, ERROR) << tr("Failed to create an appropriate display device, falling back to software display. "
+		                     "Games may run slowly, especially with larger windows.");
+		Display::setDriver(Display::Driver::QT);
+		m_display = std::unique_ptr<Display>(Display::create(this));
+	}
 #if defined(BUILD_GL) || defined(BUILD_GLES2)
 	m_shaderView.reset();
 	m_shaderView = std::make_unique<ShaderSelector>(m_display.get(), m_config);
@@ -1213,6 +1220,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	m_actions.addSeparator("file");
 #endif
 
+	m_actions.addAction(tr("Report bug..."), "bugReport", openTView<ReportView>(), "file");
 	m_actions.addAction(tr("About..."), "about", openTView<AboutScreen>(), "file");
 
 #ifndef Q_OS_MAC
@@ -1505,7 +1513,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 	addGameAction(tr("View &tiles..."), "tileWindow", openControllerTView<TileView>(), "tools");
 	addGameAction(tr("View &map..."), "mapWindow", openControllerTView<MapView>(), "tools");
 
-	Action* frameWindow = addGameAction(tr("&Frame inspector..."), "frameWindow", [this]() {
+	addGameAction(tr("&Frame inspector..."), "frameWindow", [this]() {
 		if (!m_frameView) {
 			m_frameView = new FrameView(m_controller);
 			connect(this, &Window::shutdown, this, [this]() {

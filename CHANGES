@@ -5,6 +5,7 @@ Features:
  - Separate overrides for GBC games that can also run on SGB or regular GB
  - Game Boy Player features can be enabled by default for all compatible games
  - Frame viewer support for Game Boy
+ - Bug report tool for gathering information helpful for reporting bugs
  - Mute option in homebrew ports
  - Status indicators for fast-forward and mute in homebrew ports
  - VBA bug compatibility mode for ROM hacks that don't work on real hardware
@@ -77,6 +78,8 @@ Other fixes:
  - Qt: Fix cancelling pausing before the frame ends
  - Qt: Fix gamepad event dispatching (fixes mgba.io/i/1922)
  - Qt: Pre-attach GDB stub when launching with -g (fixes mgba.io/i/1950)
+ - Qt: Fix crash when editing shortcuts with none selected (fixes mgba.io/i/1964)
+ - Qt: Fix crashing when no OpenGL context can be obtained
  - SM83: Simplify register pair access on big endian
  - SM83: Disassemble STOP as one byte
  - Wii: Fix crash on unloading irregularly sized GBA ROMs
